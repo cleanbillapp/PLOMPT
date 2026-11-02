@@ -848,8 +848,8 @@ const NOTICE = {
   type:    'info',                      // 'info'青 / 'success'緑 / 'warning'黄 / 'danger'赤
   icon:    '🆕',
   title:   'アップデートのお知らせ',
-  text:    '【アップデート】①CleanTaxへ経費データをコピペで連携できるようになりました ②文字の大きさを設定タブで調整できるようになりました(3段階+細かいスライダーも) ③フォントが見やすいSF Pro系に変わりました ④ガイドに姉妹アプリCleanSiteの案内を追加',
-  id:      'notice_v4',
+  text:    '【アップデート】①レシートまとめ（コラージュ）が枚数の多い時も落ちずに作れるようになりました（12枚ずつのページに分けて保存） ②レシート写真を追加時に自動で軽くするようになり、アプリが重くなりにくくなりました ③PDF出力で警告が出ないよう、開いた画面の「🖨️ 印刷・PDF保存」ボタンから印刷する方式になりました',
+  id:      'notice_v5',
 };
 // ══════════════════════════════════════════════════
 
@@ -1616,9 +1616,15 @@ async function exportPDF() {
 
   // 戻るボタン付きのhtmlに変更
   const htmlWithBack = html.replace('</body>', `
-  <div class="no-print" style="position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:999;">
+  <div class="no-print" style="position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:999;
+    display:flex;gap:10px;white-space:nowrap;">
+    <button onclick="window.print()" style="background:#2ecc8a;color:#fff;border:none;border-radius:24px;
+      padding:13px 22px;font-size:15px;font-weight:700;font-family:sans-serif;cursor:pointer;
+      box-shadow:0 4px 16px rgba(0,0,0,0.3);">
+      🖨️ 印刷・PDF保存
+    </button>
     <button onclick="window.close()" style="background:#1a2744;color:#fff;border:none;border-radius:24px;
-      padding:13px 32px;font-size:15px;font-weight:700;font-family:sans-serif;cursor:pointer;
+      padding:13px 22px;font-size:15px;font-weight:700;font-family:sans-serif;cursor:pointer;
       box-shadow:0 4px 16px rgba(0,0,0,0.3);">
       ✕ 閉じて戻る
     </button>
@@ -1633,10 +1639,10 @@ async function exportPDF() {
   win.document.open();
   win.document.write(htmlWithBack);
   win.document.close();
-  setTimeout(() => {
-    try { win.focus(); win.print(); } catch(e) {}
-  }, 800);
-  showToast('📥 印刷後は「✕ 閉じて戻る」ボタンで戻れます');
+  // 自動で印刷を呼ぶとSafariが「自動的に印刷することは禁止」と警告するため、
+  // 開いた画面の「印刷・PDF保存」ボタンを押してもらう方式にしている
+  try { win.focus(); } catch(e) {}
+  showToast('📥 開いた画面の「🖨️ 印刷・PDF保存」を押してください');
 }
 
 function showSafariGuide() {
