@@ -1124,13 +1124,60 @@ function selectType(el) {
 }
 
 // ─── Receipt photos ───────────────────────────────────────
-function handleReceiptUpload(ev) {
-  Array.from(ev.target.files).forEach(file => {
+// レシート写真は追加時に自動で縮小して保存（文字が読める画質は保ちつつ容量を削減）
+const RECEIPT_MAX_SIDE = 1600;   // 長い辺の最大ピクセル
+const RECEIPT_QUALITY  = 0.8;    // JPEG画質
+
+function readFileAsDataURL(file) {
+  return new Promise((resolve, reject) => {
     const r = new FileReader();
-    r.onload = e => { currentReceiptImages.push(e.target.result); renderThumbs(); };
+    r.onload  = e => resolve(e.target.result);
+    r.onerror = () => reject(r.error);
     r.readAsDataURL(file);
   });
+}
+
+function compressReceiptImage(dataUrl) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const w = img.naturalWidth, h = img.naturalHeight;
+        const scale = Math.min(1, RECEIPT_MAX_SIDE / Math.max(w, h));
+        const cw = Math.round(w * scale), ch = Math.round(h * scale);
+        const canvas = document.createElement('canvas');
+        canvas.width = cw; canvas.height = ch;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#fff';            // 透過PNG対策で白背景
+        ctx.fillRect(0, 0, cw, ch);
+        ctx.drawImage(img, 0, 0, cw, ch);
+        const out = canvas.toDataURL('image/jpeg', RECEIPT_QUALITY);
+        canvas.width = canvas.height = 0;  // メモリ解放
+        // 縮小後の方が大きくなる場合は元の画像を使う
+        resolve(out.length < dataUrl.length ? out : dataUrl);
+      } catch (e) {
+        resolve(dataUrl);
+      }
+    };
+    img.onerror = () => resolve(dataUrl);  // 読めない形式は元のまま
+    img.src = dataUrl;
+  });
+}
+
+async function handleReceiptUpload(ev) {
+  const files = Array.from(ev.target.files);
   ev.target.value = '';
+  // 1枚ずつ順番に処理（同時に処理するとメモリを圧迫するため）
+  for (const file of files) {
+    try {
+      const original = await readFileAsDataURL(file);
+      const small    = await compressReceiptImage(original);
+      currentReceiptImages.push(small);
+      renderThumbs();
+    } catch (e) {
+      showToast('⚠️ 写真の読み込みに失敗しました');
+    }
+  }
 }
 function renderThumbs() {
   document.getElementById('receiptThumbs').innerHTML = currentReceiptImages.map((src,i) => `
@@ -1613,7 +1660,14 @@ function showSafariGuide() {
 }
 
 // ─── Collage ─────────────────────────────────────────────
-function exportCollage() {
+// 枚数が多いとiPhoneのメモリ上限を超えて落ちるため、
+// 12枚ずつのページに分け、画像を1枚ずつ順番に描画する
+const COLLAGE_PER_PAGE = 12;      // 1ページの枚数（3列×4行）
+let collagePageBlobs = [];        // 各ページの画像データ
+let collagePageUrls  = [];        // プレビュー用URL
+let collageBuilding  = false;     // 作成中フラグ（連打防止）
+
+function getCollageReceiptData() {
   const exps = filteredExpenses(invoiceClientId);
   // 経費番号と紐づいたレシート情報を作成
   const receiptData = [];
@@ -1624,33 +1678,73 @@ function exportCollage() {
     });
     if ((e.receipts||[]).length > 0) no++;
   });
-  if (!receiptData.length) { showToast('レシート写真がありません'); return; }
-  const panel = document.getElementById('collagePanel');
-  panel.style.display = 'block';
-  panel.scrollIntoView({ behavior:'smooth' });
-  // プレビューに番号バッジ付きで表示（100まで対応）
-  document.getElementById('collagePreview').innerHTML = receiptData.map(d=>`
-    <div style="position:relative;flex:1 1 calc(50% - 2px);min-width:80px;">
-      <img src="${d.src}" style="width:100%;height:110px;object-fit:cover;display:block;">
-      <div style="position:absolute;top:5px;left:6px;
-                  min-width:26px;height:26px;padding:0 5px;
-                  background:rgba(255,255,255,0.92);
-                  border:1.5px solid #1a2744;
-                  border-radius:14px;
-                  display:flex;align-items:center;justify-content:center;
-                  color:#1a2744;font-size:12px;font-weight:300;
-                  font-family:var(--font-main);
-                  letter-spacing:-0.5px;line-height:1;">
-        ${d.no}
-      </div>
-    </div>`).join('');
-  buildCollageCanvas(receiptData);
+  return receiptData;
 }
 
-function buildCollageCanvas(receiptData) {
+async function exportCollage() {
+  if (collageBuilding) return;
+  const receiptData = getCollageReceiptData();
+  if (!receiptData.length) { showToast('レシート写真がありません'); return; }
+
+  collageBuilding = true;
+  // 前回のプレビューを解放
+  collagePageUrls.forEach(u => URL.revokeObjectURL(u));
+  collagePageUrls  = [];
+  collagePageBlobs = [];
+
+  const panel   = document.getElementById('collagePanel');
+  const preview = document.getElementById('collagePreview');
+  panel.style.display = 'block';
+  panel.scrollIntoView({ behavior:'smooth' });
+
+  const totalPages = Math.ceil(receiptData.length / COLLAGE_PER_PAGE);
+  const setProgress = (done) => {
+    preview.innerHTML = `<div style="width:100%;padding:30px 10px;text-align:center;font-size:13px;color:var(--text-sub);">
+      作成中… ${done} / ${totalPages} ページ<br><span style="font-size:11px;">（レシート${receiptData.length}枚）</span></div>`;
+  };
+  setProgress(0);
+
+  try {
+    for (let p = 0; p < totalPages; p++) {
+      const items = receiptData.slice(p * COLLAGE_PER_PAGE, (p + 1) * COLLAGE_PER_PAGE);
+      const blob = await buildCollagePage(items);
+      if (blob) collagePageBlobs.push(blob);
+      setProgress(p + 1);
+    }
+  } catch (e) {
+    collageBuilding = false;
+    preview.innerHTML = '';
+    showToast('⚠️ コラージュの作成に失敗しました');
+    return;
+  }
+
+  // ページごとのプレビューを表示
+  collagePageUrls = collagePageBlobs.map(b => URL.createObjectURL(b));
+  preview.innerHTML = collagePageUrls.map((u, i) => `
+    <div style="width:100%;flex:none;margin-bottom:6px;">
+      ${collagePageUrls.length > 1 ? `<div style="font-size:11px;color:var(--text-sub);padding:4px 6px;">${i+1} / ${collagePageUrls.length} ページ</div>` : ''}
+      <img src="${u}" style="width:100%;height:auto;flex:none;object-fit:contain;display:block;">
+    </div>`).join('');
+
+  collageBuilding = false;
+  showToast(`✅ ${collagePageBlobs.length}ページのコラージュができました。保存ボタンを押してください`);
+}
+
+// 画像を1枚読み込む（失敗時はnull）
+function loadCollageImage(src) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload  = () => resolve(img);
+    img.onerror = () => resolve(null);
+    img.src = src;
+  });
+}
+
+// 1ページ分を描画してJPEG画像として返す
+async function buildCollagePage(items) {
   const canvas = document.getElementById('collageCanvas');
-  const cols = Math.min(receiptData.length, 3);
-  const rows = Math.ceil(receiptData.length / cols);
+  const cols = Math.min(items.length, 3);
+  const rows = Math.ceil(items.length / cols);
   const cell = 400;
   canvas.width  = cols * cell;
   canvas.height = rows * cell;
@@ -1658,102 +1752,98 @@ function buildCollageCanvas(receiptData) {
   ctx.fillStyle = '#fff';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // 全画像をPromiseで並列読み込みし、全部揃ってから一括描画
-  const promises = receiptData.map((d, i) => new Promise((resolve) => {
-    const img = new Image();
-    img.onload  = () => resolve({ img, i, no: d.no });
-    img.onerror = () => resolve(null);
-    img.src = d.src;
-  }));
+  // 1枚ずつ順番に読み込み→描画→解放（同時に読み込まない）
+  for (let i = 0; i < items.length; i++) {
+    const img = await loadCollageImage(items[i].src);
+    if (!img) continue;
+    const x = (i % cols) * cell;
+    const y = Math.floor(i / cols) * cell;
+    ctx.drawImage(img, x, y, cell, cell);
+    drawCollageBadge(ctx, x, y, items[i].no);
+    img.src = ''; // メモリ解放
+  }
 
-  Promise.all(promises).then(results => {
-    results.forEach(r => {
-      if (!r) return;
-      const col = r.i % cols;
-      const row = Math.floor(r.i / cols);
-      const x = col * cell;
-      const y = row * cell;
-      ctx.drawImage(r.img, x, y, cell, cell);
-
-      // 番号バッジを左上に描画（細丸スタイル・100まで対応）
-      const numStr = String(r.no);
-      const badgeH = 52;
-      const badgeW = numStr.length > 1 ? badgeH + 16 : badgeH;
-      const bx = x + 16;
-      const by = y + 16;
-      const br = badgeH / 2;
-
-      // 白背景の丸（または角丸矩形）
-      ctx.beginPath();
-      if (numStr.length > 1) {
-        // 角丸矩形
-        ctx.moveTo(bx + br, by);
-        ctx.lineTo(bx + badgeW - br, by);
-        ctx.arcTo(bx + badgeW, by, bx + badgeW, by + br, br);
-        ctx.lineTo(bx + badgeW, by + badgeH - br);
-        ctx.arcTo(bx + badgeW, by + badgeH, bx + badgeW - br, by + badgeH, br);
-        ctx.lineTo(bx + br, by + badgeH);
-        ctx.arcTo(bx, by + badgeH, bx, by + badgeH - br, br);
-        ctx.lineTo(bx, by + br);
-        ctx.arcTo(bx, by, bx + br, by, br);
-        ctx.closePath();
-      } else {
-        ctx.arc(bx + br, by + br, br, 0, Math.PI * 2);
-      }
-      ctx.fillStyle = 'rgba(255,255,255,0.93)';
-      ctx.fill();
-      // 細い枠線（ネイビー）
-      ctx.strokeStyle = '#1a2744';
-      ctx.lineWidth = 2.5;
-      ctx.stroke();
-
-      // 番号テキスト（細め・ネイビー）
-      ctx.fillStyle = '#1a2744';
-      ctx.font = `300 ${badgeH * 0.52}px sans-serif`;
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText(numStr, bx + badgeW / 2, by + badgeH / 2);
-    });
-    showToast('✅ コラージュの準備ができました。保存ボタンを押してください');
-  });
+  return new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.85));
 }
+
+// 番号バッジを左上に描画（細丸スタイル・100まで対応）
+function drawCollageBadge(ctx, x, y, no) {
+  const numStr = String(no);
+  const badgeH = 52;
+  const badgeW = numStr.length > 1 ? badgeH + 16 : badgeH;
+  const bx = x + 16;
+  const by = y + 16;
+  const br = badgeH / 2;
+
+  ctx.beginPath();
+  if (numStr.length > 1) {
+    // 角丸矩形
+    ctx.moveTo(bx + br, by);
+    ctx.lineTo(bx + badgeW - br, by);
+    ctx.arcTo(bx + badgeW, by, bx + badgeW, by + br, br);
+    ctx.lineTo(bx + badgeW, by + badgeH - br);
+    ctx.arcTo(bx + badgeW, by + badgeH, bx + badgeW - br, by + badgeH, br);
+    ctx.lineTo(bx + br, by + badgeH);
+    ctx.arcTo(bx, by + badgeH, bx, by + badgeH - br, br);
+    ctx.lineTo(bx, by + br);
+    ctx.arcTo(bx, by, bx + br, by, br);
+    ctx.closePath();
+  } else {
+    ctx.arc(bx + br, by + br, br, 0, Math.PI * 2);
+  }
+  ctx.fillStyle = 'rgba(255,255,255,0.93)';
+  ctx.fill();
+  ctx.strokeStyle = '#1a2744';
+  ctx.lineWidth = 2.5;
+  ctx.stroke();
+
+  ctx.fillStyle = '#1a2744';
+  ctx.font = `300 ${badgeH * 0.52}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(numStr, bx + badgeW / 2, by + badgeH / 2);
+}
+
 async function downloadCollage() {
-  const canvas = document.getElementById('collageCanvas');
+  if (!collagePageBlobs.length) { showToast('先に「レシートまとめ」を作成してください'); return; }
+
+  const isIOS2 = /iphone|ipad|ipod/i.test(navigator.userAgent);
+  const inApp2 = isIOS2 && !navigator.standalone &&
+    /(instagram|fbav|twitter|line|claude)/i.test(navigator.userAgent);
+  if (inApp2) {
+    showToast('⚠️ SafariまたはChromeで開いてご利用ください');
+    showSafariGuide();
+    return;
+  }
+
   const cl = getClient(invoiceClientId);
-  const filename = `レシートまとめ_${cl ? cl.company + '_' : ''}${monthKey(currentMonth)}.png`;
+  const base = `レシートまとめ_${cl ? cl.company + '_' : ''}${monthKey(currentMonth)}`;
+  const n = collagePageBlobs.length;
+  const files = collagePageBlobs.map((b, i) =>
+    new File([b], n > 1 ? `${base}_${i+1}of${n}.jpg` : `${base}.jpg`, { type: 'image/jpeg' })
+  );
 
-  canvas.toBlob(async (blob) => {
-    const file = new File([blob], filename, { type: 'image/png' });
+  const downloadAll = () => {
+    files.forEach((f, i) => {
+      setTimeout(() => {
+        const url = URL.createObjectURL(f);
+        const a = document.createElement('a');
+        a.href = url; a.download = f.name; a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+      }, i * 400);
+    });
+  };
 
-    const isIOS2 = /iphone|ipad|ipod/i.test(navigator.userAgent);
-    const inApp2 = isIOS2 && !navigator.standalone &&
-      /(instagram|fbav|twitter|line|claude)/i.test(navigator.userAgent);
-
-    if (inApp2) {
-      showToast('⚠️ SafariまたはChromeで開いてご利用ください');
-      showSafariGuide();
-      return;
+  if (navigator.canShare && navigator.canShare({ files })) {
+    try {
+      await navigator.share({ files, title: base });
+    } catch(e) {
+      if (e.name !== 'AbortError') downloadAll();
     }
-
-    if (navigator.canShare && navigator.canShare({ files: [file] })) {
-      try {
-        await navigator.share({ files: [file], title: filename });
-      } catch(e) {
-        if (e.name !== 'AbortError') {
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url; a.download = filename; a.click();
-          setTimeout(() => URL.revokeObjectURL(url), 5000);
-        }
-      }
-    } else {
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = filename; a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 5000);
-      showToast('🖼️ ダウンロードフォルダに保存されました');
-    }
-  }, 'image/png');
+  } else {
+    downloadAll();
+    showToast('🖼️ ダウンロードフォルダに保存されました');
+  }
 }
 
 // ─── Client management ───────────────────────────────────
